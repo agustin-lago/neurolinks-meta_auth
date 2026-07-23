@@ -132,15 +132,17 @@ function readSignedPayload(searchParams) {
     return { ok: false, status: 403, error: 'Expired session' };
   }
 
-  if (!data.projectId || !data.redirectUri) {
-    return { ok: false, status: 400, error: 'Missing projectId or redirectUri' };
+  const callbackUri = data.callbackUri || data.redirectUri;
+  if (!data.projectId || !callbackUri) {
+    return { ok: false, status: 400, error: 'Missing projectId or callbackUri' };
   }
 
-  if (!isAllowedRedirect(data.redirectUri)) {
-    return { ok: false, status: 403, error: 'Redirect host is not allowed' };
+  if (!isAllowedRedirect(callbackUri)) {
+    return { ok: false, status: 403, error: 'Callback host is not allowed' };
   }
 
-  return { ok: true, data };
+  data.callbackUri = callbackUri;
+  return { ok: true, data, payload, sig };
 }
 
 function escapeHtml(value) {
@@ -163,11 +165,12 @@ function buildMetaAuthPage(session) {
   const appId = session.metaAppId || META_APP_ID;
   const configId = session.configId || META_CONFIG_ID;
   const projectId = session.projectId;
-  const redirectUri = session.redirectUri;
   const state = session.state || session.nonce || crypto.randomUUID();
+  const signedPayload = session.signedPayload;
+  const signedSig = session.signedSig;
 
-  if (!appId || !configId) {
-    return { status: 500, body: errorPage('Configuracion incompleta', 'Faltan META_APP_ID o META_CONFIG_ID.') };
+  if (!appId || !configId || !signedPayload || !signedSig) {
+    return { status: 500, body: errorPage('Configuracion incompleta', 'Faltan datos internos para iniciar la vinculacion con Meta.') };
   }
 
   const safe = (value) => JSON.stringify(String(value || ''));
@@ -203,8 +206,9 @@ function buildMetaAuthPage(session) {
     const appId = ${safe(appId)};
     const configId = ${safe(configId)};
     const projectId = ${safe(projectId)};
-    const redirectUri = ${safe(redirectUri)};
     const state = ${safe(state)};
+    const signedPayload = ${safe(signedPayload)};
+    const signedSig = ${safe(signedSig)};
     let wabaId = '';
     let phoneId = '';
 
@@ -224,7 +228,9 @@ function buildMetaAuthPage(session) {
     });
 
     function finishWith(params) {
-      const target = new URL(redirectUri);
+      const target = new URL('/onboard-callback', window.location.origin);
+      target.searchParams.set('payload', signedPayload);
+      target.searchParams.set('sig', signedSig);
       target.searchParams.set('projectId', projectId);
       target.searchParams.set('state', state);
       if (params.code) target.searchParams.set('code', params.code);
@@ -279,8 +285,65 @@ function handleMetaAuth(req, res, url) {
     return;
   }
 
-  const page = buildMetaAuthPage(session.data);
+  const page = buildMetaAuthPage({ ...session.data, signedPayload: session.payload, signedSig: session.sig });
   html(res, page.status, page.body);
+}
+
+function buildRedirectingPage(targetUrl) {
+  const safeTarget = JSON.stringify(targetUrl);
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Finalizando vinculacion</title><style>body{font-family:system-ui;margin:0;min-height:100vh;display:grid;place-items:center;background:#0f1117;color:#f8fafc}main{max-width:520px;padding:28px;text-align:center}p{color:#b8c0cc}</style></head><body><main><h1>Finalizando vinculacion</h1><p>Estamos guardando la configuracion de Meta.</p></main><script>window.location.replace(${safeTarget});</script></body></html>`;
+}
+
+function handleOnboardCallback(req, res, url) {
+  const session = readSignedPayload(url.searchParams);
+  if (!session.ok) {
+    html(res, session.status, errorPage('Acceso no autorizado', 'La sesion de vinculacion no es valida o expiro.'));
+    return;
+  }
+
+  const code = String(url.searchParams.get('code') || '').trim();
+  if (!code) {
+    html(res, 400, errorPage('Meta no envio autorizacion', 'No se recibio el codigo necesario para finalizar la vinculacion.'));
+    return;
+  }
+
+  const state = String(url.searchParams.get('state') || '').trim();
+  if (session.data.state && state && state !== String(session.data.state)) {
+    html(res, 403, errorPage('Sesion invalida', 'El estado de la vinculacion no coincide.'));
+    return;
+  }
+
+  let target;
+  try {
+    target = new URL(session.data.callbackUri);
+  } catch {
+    html(res, 400, errorPage('Callback invalido', 'No se pudo resolver el destino del backoffice.'));
+    return;
+  }
+
+  const projectId = String(session.data.projectId || '').trim();
+  const wabaId = String(url.searchParams.get('wabaId') || '').trim();
+  const phoneId = String(url.searchParams.get('phoneId') || '').trim();
+  const callbackData = {
+    projectId,
+    state: session.data.state || state,
+    code,
+    wabaId,
+    phoneId,
+    exp: Math.floor(Date.now() / 1000) + 300,
+  };
+  const callbackPayload = base64urlEncode(JSON.stringify(callbackData));
+  const callbackSig = signPayload(callbackPayload);
+
+  target.searchParams.set('projectId', projectId);
+  target.searchParams.set('state', String(callbackData.state || ''));
+  target.searchParams.set('code', code);
+  if (wabaId) target.searchParams.set('wabaId', wabaId);
+  if (phoneId) target.searchParams.set('phoneId', phoneId);
+  target.searchParams.set('metaAuthPayload', callbackPayload);
+  target.searchParams.set('metaAuthSig', callbackSig);
+
+  html(res, 200, buildRedirectingPage(target.toString()));
 }
 
 function handleSignDebug(req, res, url) {
@@ -294,16 +357,16 @@ function handleSignDebug(req, res, url) {
     return;
   }
 
-  const redirectUri = url.searchParams.get('redirectUri') || '';
+  const callbackUri = url.searchParams.get('callbackUri') || url.searchParams.get('redirectUri') || '';
   const projectId = url.searchParams.get('projectId') || 'demo';
 
-  if (!isAllowedRedirect(redirectUri)) {
-    json(res, 403, { error: 'Redirect host is not allowed' });
+  if (!isAllowedRedirect(callbackUri)) {
+    json(res, 403, { error: 'Callback host is not allowed' });
     return;
   }
 
   const exp = Math.floor(Date.now() / 1000) + 600;
-  const payload = base64urlEncode(JSON.stringify({ projectId, redirectUri, exp }));
+  const payload = base64urlEncode(JSON.stringify({ projectId, callbackUri, exp, state: crypto.randomUUID() }));
   const sig = signPayload(payload);
   json(res, 200, { payload, sig, url: `/meta-auth?payload=${encodeURIComponent(payload)}&sig=${encodeURIComponent(sig)}` });
 }
@@ -323,6 +386,11 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/meta-auth') {
     handleMetaAuth(req, res, url);
+    return;
+  }
+
+  if (url.pathname === '/onboard-callback') {
+    handleOnboardCallback(req, res, url);
     return;
   }
 
